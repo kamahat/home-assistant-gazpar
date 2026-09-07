@@ -1,3 +1,4 @@
+import logging
 from typing import Any, Union
 
 from homeassistant.components.sensor.const import (
@@ -15,7 +16,6 @@ from homeassistant.const import (
     UnitOfEnergy,
 )
 from pygazpar.enum import Frequency, PropertyName  # type: ignore
-import logging
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -81,9 +81,7 @@ class Util:
                     converterFactorStr = reading[PropertyName.CONVERTER_FACTOR.value]
 
                     if endIndexRaw is None or converterFactorStr is None:
-                        _LOGGER.debug(
-                            "Skipping daily reading with missing index/converter factor: %s", reading
-                        )
+                        _LOGGER.debug("Skipping daily reading with missing index/converter factor: %s", reading)
                         continue
 
                     endIndex = float(endIndexRaw)
