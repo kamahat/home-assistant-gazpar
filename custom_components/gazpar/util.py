@@ -15,6 +15,9 @@ from homeassistant.const import (
     UnitOfEnergy,
 )
 from pygazpar.enum import Frequency, PropertyName  # type: ignore
+import logging
+
+_LOGGER = logging.getLogger(__name__)
 
 HA_ATTRIBUTION = "Data provided by GrDF"
 
@@ -32,9 +35,36 @@ ATTR_ERROR_MESSAGES = "errorMessages"
 # --------------------------------------------------------------------------------------------
 class Util:
 
+    # A single day's gas volume can never legitimately exceed this, even for a large house in
+    # extreme cold. Used to reject a corrupted/implausible reading from a single API response
+    # instead of trusting it blindly (root cause of the 2024-10-14 incident: a single bad
+    # end_index_m3 value propagated directly into the cumulative state).
+    MAX_PLAUSIBLE_DAILY_VOLUME_M3 = 500.0
+
     # ----------------------------------
     @staticmethod
     def toState(pygazparData: dict[str, list[dict[str, Any]]]) -> Union[float, None]:
+        """Compute the cumulative energy state from the most recent plausible daily reading.
+
+        Previous implementation walked backward from the most recent day while
+        start_index_m3 == end_index_m3 (treating this as "no reading yet"), summed the
+        energy_kwh of the skipped days, and used whichever day it landed on (index,
+        clamped to the end of the array if none matched) as the base for
+        volumeEndIndex * converterFactor. That heuristic cannot distinguish "GRDF hasn't
+        published today's reading yet" from "the meter genuinely recorded zero
+        consumption today" (e.g. heating appliance switched off for an extended period),
+        and its result depended on how many days of history happened to be returned by
+        the data source on a given poll -- an unrelated implementation detail. Both
+        caused the reported state to silently drift for a stale/frozen index and then
+        jump abruptly once a differing index reappeared.
+
+        This implementation instead always anchors on the most recent day whose reading
+        is present and physically plausible, using its end_index_m3 directly -- which is
+        already GRDF's authoritative cumulative meter index and requires no backward
+        accumulation. A day is skipped (and a warning logged) only if its index/converter
+        factor is missing, or if it implies an implausible single-day volume -- guarding
+        against a single corrupted API response inflating the cumulative total.
+        """
 
         res = None
 
@@ -43,44 +73,36 @@ class Util:
             dailyData = pygazparData[Frequency.DAILY.value]
 
             if dailyData is not None and len(dailyData) > 0:
-                currentIndex = 0
-                cumulativeEnergy = 0.0
 
-                # For low consumption, we also use the energy column in addition to the volume index columns
-                # and compute more accurately the consumed energy.
-                startIndex = dailyData[currentIndex][PropertyName.START_INDEX.value]
-                endIndex = dailyData[currentIndex][PropertyName.END_INDEX.value]
+                for reading in dailyData:
 
-                while (
-                    (startIndex is not None)
-                    and (endIndex is not None)
-                    and (currentIndex < len(dailyData))
-                    and (float(startIndex) == float(endIndex))
-                ):
-                    energy = dailyData[currentIndex][PropertyName.ENERGY.value]
-                    if energy is not None:
-                        cumulativeEnergy += float(energy)
-                    currentIndex += 1
-                    if currentIndex < len(dailyData):
-                        startIndex = dailyData[currentIndex][PropertyName.START_INDEX.value]
-                        endIndex = dailyData[currentIndex][PropertyName.END_INDEX.value]
+                    endIndexRaw = reading[PropertyName.END_INDEX.value]
+                    startIndexRaw = reading[PropertyName.START_INDEX.value]
+                    converterFactorStr = reading[PropertyName.CONVERTER_FACTOR.value]
 
-                currentIndex = min(currentIndex, len(dailyData) - 1)
+                    if endIndexRaw is None or converterFactorStr is None:
+                        _LOGGER.debug(
+                            "Skipping daily reading with missing index/converter factor: %s", reading
+                        )
+                        continue
 
-                endIndex = dailyData[currentIndex][PropertyName.END_INDEX.value]
-                converterFactorStr = dailyData[currentIndex][PropertyName.CONVERTER_FACTOR.value]
-
-                if endIndex is not None:
-                    volumeEndIndex = float(endIndex)
-                else:
-                    raise ValueError("End index is missing in the daily data.")
-
-                if converterFactorStr is not None:
+                    endIndex = float(endIndexRaw)
                     converterFactor = float(converterFactorStr)
-                else:
-                    raise ValueError("Converter factor is missing in the daily data.")
 
-                res = volumeEndIndex * converterFactor + cumulativeEnergy
+                    if startIndexRaw is not None:
+                        impliedVolume = endIndex - float(startIndexRaw)
+                        if impliedVolume < 0 or impliedVolume > Util.MAX_PLAUSIBLE_DAILY_VOLUME_M3:
+                            _LOGGER.warning(
+                                "Rejecting implausible daily reading (implied volume %.2f m3, "
+                                "max plausible %.2f m3): %s",
+                                impliedVolume,
+                                Util.MAX_PLAUSIBLE_DAILY_VOLUME_M3,
+                                reading,
+                            )
+                            continue
+
+                    res = endIndex * converterFactor
+                    break
 
         return res
 
