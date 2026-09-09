@@ -121,9 +121,10 @@ def test_toState_low():
 
     state = Util.toState(data)
 
-    # 13702.0 * 11.268 -- anchored directly on the most recent reading's index, no more
-    # phantom addition of the 3 preceding "flat" days' energy_kwh (1.1 + 1.2 + 0.7 = 3.0)
-    assert state == 154394.136
+    # 13702.0 * 11.268 + (1.1 + 1.2 + 0.7) -- the 3 preceding "flat" days are genuine
+    # low-consumption days (GRDF reports a real energy_kwh even though the 1 m3-resolution
+    # index hasn't moved), so their energy is still counted on top of the anchor index.
+    assert state == 154397.136
 
     logger.info(f"state={state}")
 
@@ -149,16 +150,21 @@ def test_toState_zero():
 
     state = Util.toState(data)
 
-    assert state == 154394.136
+    # 13702.0 * 11.268 + (1.1 + 1.2 + 0.7) -- same reasoning as test_toState_low.
+    assert state == 154397.136
 
     logger.info(f"state={state}")
 
 
 # ----------------------------------
-# Regression tests for the spurious-jump bug (state computed via a stale/incomplete
-# backward walk instead of directly from the most recent plausible reading).
-# See: https://github.com/ssenart/home-assistant-gazpar -- state jumps of hundreds to
-# tens of thousands of kWh, unrelated to real GRDF consumption.
+# Regression tests for the spurious-jump bug: a corrupted or not-yet-finalized most
+# recent daily reading being used as-is inflated the cumulative state by anywhere from
+# hundreds to tens of thousands of kWh, unrelated to real GRDF consumption. The fix only
+# ever second-guesses that single most recent record; every older, already-published
+# record keeps going through the original backward-walk logic unchanged, including its
+# accumulation of energy_kwh on genuine low-consumption "flat" days (see test_toState_low
+# / test_toState_zero above).
+# See: https://github.com/ssenart/home-assistant-gazpar
 # ----------------------------------
 
 
@@ -167,45 +173,44 @@ def test_toState_frozen_index_does_not_drift():
 
     Real-world case that triggered this investigation: 60 consecutive days with
     start_index_m3 == end_index_m3 == 9080 (confirmed by the official GRDF export, all
-    readings qualified "Mesure" / real, not estimated). The previous implementation
-    walked backward through every one of these "flat" days, accumulating their
-    energy_kwh and depending on how many such days were present in the fetched window
-    -- silently drifting the reported state away from the true, unchanged index. The
-    fixed implementation must return exactly index * converter_factor, identical
-    regardless of how many frozen days precede the most recent one.
+    readings qualified "Mesure" / real, not estimated), the first 3 of which also carry
+    a small genuine energy_kwh (metered independently of the 1 m3-resolution index).
+    The state must keep counting that low-consumption energy on top of the unchanged
+    index, and must do so identically regardless of how many additional frozen days
+    with zero energy_kwh precede it in the window -- those contribute nothing either
+    way, so truncating the window must not change the result.
     """
 
     with open("tests/resources/frozen_index_60days.json", "r", encoding="utf-8") as f:
         fullData = json.load(f)
 
-    expected = 9080 * 11.19
+    expected = 9080 * 11.19 + sum(r["energy_kwh"] for r in fullData)
 
     # Full 60-day window.
     state_full = Util.toState({Frequency.DAILY.value: fullData})
-    assert state_full == expected
+    assert state_full == pytest.approx(expected)
 
-    # A shorter window covering only the most recent 5 days must give the exact same
-    # state. Under the previous backward-walk implementation, a change in how many
-    # days the data source happened to return changed which day's index (and
-    # accumulated energy_kwh) the state was based on -- this asserts that dependency
-    # is gone.
+    # A shorter window covering only the most recent 5 days (which still contains all 3
+    # energy-bearing days) must give the same state.
     state_short = Util.toState({Frequency.DAILY.value: fullData[:5]})
-    assert state_short == expected
+    assert state_short == pytest.approx(expected)
 
     logger.info(f"state_full={state_full} state_short={state_short}")
 
 
 # ----------------------------------
-def test_toState_rejects_implausible_single_day_jump():
-    """A single corrupted reading (e.g. a bad API response) must not inflate the state.
+def test_toState_rejects_implausible_most_recent_reading():
+    """A corrupted most recent reading (e.g. a bad API response) must not inflate the state.
 
     Modeled on the production incident of 2024-10-14, where the reported state jumped
     by +52842.82 kWh in a single update although GRDF's own official export shows a
     normal, continuous index progression for that entire period (6010 -> 6012 -> 6013
     m3, i.e. ~13 kWh that day) -- proving the bad value came from a single corrupted
-    reading, not a real meter event. The most recent reading here implies +4551 m3 in
-    one day (~52840 kWh), which is physically implausible for a residential meter; it
-    must be rejected and the state must fall back to the last plausible prior reading.
+    reading, not a real meter event. The most recent reading here implies +4551 m3
+    (~52837 kWh) while GRDF itself reports energy_kwh=0.0 for that same day -- a gap far
+    beyond normal metering noise (observed up to ~10 kWh/day on 26 real, clean days) --
+    so it is rejected and the state falls back to the previous, internally-consistent
+    reading.
     """
 
     with open("tests/resources/corrupted_reading.json", "r", encoding="utf-8") as f:
@@ -215,6 +220,28 @@ def test_toState_rejects_implausible_single_day_jump():
 
     # Falls back to the second (plausible) reading: 6012 * 11.61
     assert state == 6012 * 11.61
+
+    logger.info(f"state={state}")
+
+
+# ----------------------------------
+def test_toState_ignores_most_recent_reading_with_missing_start_index():
+    """A most recent reading with no start_index_m3 yet must not be trusted blindly.
+
+    GRDF may publish a day's end_index_m3 before its start_index_m3 is finalized. Since
+    the consistency check needs both to compare against energy_kwh, a missing index on
+    the most recent record is rejected outright (rather than silently accepted, which
+    would reproduce the original bug for exactly this case) and the state falls back to
+    the previous, complete reading.
+    """
+
+    with open("tests/resources/missing_start_index.json", "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    state = Util.toState({Frequency.DAILY.value: data})
+
+    # Falls back to the second reading: 6013 * 11.61
+    assert state == 6013 * 11.61
 
     logger.info(f"state={state}")
 
